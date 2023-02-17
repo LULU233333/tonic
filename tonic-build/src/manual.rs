@@ -216,14 +216,14 @@ impl crate::Method for Method {
         _proto_path: &str,
         _compile_well_known_types: bool,
     ) -> (TokenStream, TokenStream) {
-        fn str_to_token_stream(vlaue: &str) -> TokenStream {
-            let vlaue = vlaue.trim();
-            if vlaue.contains('(') && vlaue.contains(')') {
-                syn::parse_str::<syn::TypeTuple>(vlaue)
+        fn str_to_token_stream(value: &str) -> TokenStream {
+            let value = value.trim();
+            if value.contains('(') && value.contains(')') {
+                syn::parse_str::<syn::TypeTuple>(value)
                     .unwrap()
                     .to_token_stream()
             } else {
-                syn::parse_str::<syn::Path>(vlaue)
+                syn::parse_str::<syn::Path>(value)
                     .unwrap()
                     .to_token_stream()
             }
