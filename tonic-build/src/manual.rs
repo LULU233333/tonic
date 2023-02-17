@@ -216,12 +216,21 @@ impl crate::Method for Method {
         _proto_path: &str,
         _compile_well_known_types: bool,
     ) -> (TokenStream, TokenStream) {
-        let request = syn::parse_str::<syn::Path>(&self.input_type)
-            .unwrap()
-            .to_token_stream();
-        let response = syn::parse_str::<syn::Path>(&self.output_type)
-            .unwrap()
-            .to_token_stream();
+        fn str_to_token_stream(vlaue: &str) -> TokenStream {
+            let vlaue = vlaue.trim();
+            if vlaue.contains('(') && vlaue.contains(')') {
+                syn::parse_str::<syn::TypeTuple>(vlaue)
+                    .unwrap()
+                    .to_token_stream()
+            } else {
+                syn::parse_str::<syn::Path>(vlaue)
+                    .unwrap()
+                    .to_token_stream()
+            }
+        }
+
+        let request = str_to_token_stream(&self.input_type);
+        let response = str_to_token_stream(&self.output_type);
         (request, response)
     }
 }
