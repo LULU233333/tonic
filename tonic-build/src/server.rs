@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use super::{Attributes, Method, Service};
-use crate::{format_method_name, generate_doc_comment, generate_doc_comments, naive_snake_case};
+use crate::{
+    format_method_name, format_method_path, format_service_name, generate_doc_comment,
+    generate_doc_comments, naive_snake_case,
+};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{Ident, Lit, LitStr};
@@ -25,6 +28,7 @@ pub fn generate<T: Service>(
         compile_well_known_types,
         attributes,
         &HashSet::default(),
+        false,
     )
 }
 
@@ -35,8 +39,15 @@ pub(crate) fn generate_internal<T: Service>(
     compile_well_known_types: bool,
     attributes: &Attributes,
     disable_comments: &HashSet<String>,
+    use_arc_self: bool,
 ) -> TokenStream {
-    let methods = generate_methods(service, proto_path, compile_well_known_types);
+    let methods = generate_methods(
+        service,
+        emit_package,
+        proto_path,
+        compile_well_known_types,
+        use_arc_self,
+    );
 
     let server_service = quote::format_ident!("{}Server", service.name());
     let server_trait = quote::format_ident!("{}", service.name());
@@ -48,25 +59,21 @@ pub(crate) fn generate_internal<T: Service>(
         compile_well_known_types,
         server_trait.clone(),
         disable_comments,
+        use_arc_self,
     );
     let package = if emit_package { service.package() } else { "" };
     // Transport based implementations
-    let path = format!(
-        "{}{}{}",
-        package,
-        if package.is_empty() { "" } else { "." },
-        service.identifier()
-    );
+    let service_name = format_service_name(service, emit_package);
 
-    let service_doc = if disable_comments.contains(&path) {
+    let service_doc = if disable_comments.contains(&service_name) {
         TokenStream::new()
     } else {
         generate_doc_comments(service.comment())
     };
 
-    let named = generate_named(&server_service, &server_trait, &path);
+    let named = generate_named(&server_service, &server_trait, &service_name);
     let mod_attributes = attributes.for_mod(package);
-    let struct_attributes = attributes.for_struct(&path);
+    let struct_attributes = attributes.for_struct(&service_name);
 
     let configure_compression_methods = quote! {
         /// Enable decompressing requests with the given encoding.
@@ -80,6 +87,26 @@ pub(crate) fn generate_internal<T: Service>(
         #[must_use]
         pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
             self.send_compression_encodings.enable(encoding);
+            self
+        }
+    };
+
+    let configure_max_message_size_methods = quote! {
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
             self
         }
     };
@@ -106,6 +133,8 @@ pub(crate) fn generate_internal<T: Service>(
                 inner: _Inner<T>,
                 accept_compression_encodings: EnabledCompressionEncodings,
                 send_compression_encodings: EnabledCompressionEncodings,
+                max_decoding_message_size: Option<usize>,
+                max_encoding_message_size: Option<usize>,
             }
 
             struct _Inner<T>(Arc<T>);
@@ -121,6 +150,8 @@ pub(crate) fn generate_internal<T: Service>(
                         inner,
                         accept_compression_encodings: Default::default(),
                         send_compression_encodings: Default::default(),
+                        max_decoding_message_size: None,
+                        max_encoding_message_size: None,
                     }
                 }
 
@@ -132,6 +163,8 @@ pub(crate) fn generate_internal<T: Service>(
                 }
 
                 #configure_compression_methods
+
+                #configure_max_message_size_methods
             }
 
             impl<T, B> tonic::codegen::Service<http::Request<B>> for #server_service<T>
@@ -173,6 +206,8 @@ pub(crate) fn generate_internal<T: Service>(
                         inner,
                         accept_compression_encodings: self.accept_compression_encodings,
                         send_compression_encodings: self.send_compression_encodings,
+                        max_decoding_message_size: self.max_decoding_message_size,
+                        max_encoding_message_size: self.max_encoding_message_size,
                     }
                 }
             }
@@ -201,6 +236,7 @@ fn generate_trait<T: Service>(
     compile_well_known_types: bool,
     server_trait: Ident,
     disable_comments: &HashSet<String>,
+    use_arc_self: bool,
 ) -> TokenStream {
     let methods = generate_trait_methods(
         service,
@@ -208,6 +244,7 @@ fn generate_trait<T: Service>(
         proto_path,
         compile_well_known_types,
         disable_comments,
+        use_arc_self,
     );
     let trait_doc = generate_doc_comment(format!(
         " Generated trait containing gRPC methods that should be implemented for use with {}Server.",
@@ -229,35 +266,41 @@ fn generate_trait_methods<T: Service>(
     proto_path: &str,
     compile_well_known_types: bool,
     disable_comments: &HashSet<String>,
+    use_arc_self: bool,
 ) -> TokenStream {
     let mut stream = TokenStream::new();
 
-    let package = if emit_package { service.package() } else { "" };
     for method in service.methods() {
         let name = quote::format_ident!("{}", method.name());
 
         let (req_message, res_message) =
             method.request_response_name(proto_path, compile_well_known_types);
 
-        let method_doc = if disable_comments.contains(&format_method_name(package, service, method))
-        {
-            TokenStream::new()
+        let method_doc =
+            if disable_comments.contains(&format_method_name(service, method, emit_package)) {
+                TokenStream::new()
+            } else {
+                generate_doc_comments(method.comment())
+            };
+
+        let self_param = if use_arc_self {
+            quote!(self: std::sync::Arc<Self>)
         } else {
-            generate_doc_comments(method.comment())
+            quote!(&self)
         };
 
         let method = match (method.client_streaming(), method.server_streaming()) {
             (false, false) => {
                 quote! {
                     #method_doc
-                    async fn #name(&self, request: tonic::Request<#req_message>)
+                    async fn #name(#self_param, request: tonic::Request<#req_message>)
                         -> std::result::Result<tonic::Response<#res_message>, tonic::Status>;
                 }
             }
             (true, false) => {
                 quote! {
                     #method_doc
-                    async fn #name(&self, request: tonic::Request<tonic::Streaming<#req_message>>)
+                    async fn #name(#self_param, request: tonic::Request<tonic::Streaming<#req_message>>)
                         -> std::result::Result<tonic::Response<#res_message>, tonic::Status>;
                 }
             }
@@ -273,7 +316,7 @@ fn generate_trait_methods<T: Service>(
                     type #stream: futures_core::Stream<Item = std::result::Result<#res_message, tonic::Status>> + Send + 'static;
 
                     #method_doc
-                    async fn #name(&self, request: tonic::Request<#req_message>)
+                    async fn #name(#self_param, request: tonic::Request<#req_message>)
                         -> std::result::Result<tonic::Response<Self::#stream>, tonic::Status>;
                 }
             }
@@ -289,7 +332,7 @@ fn generate_trait_methods<T: Service>(
                     type #stream: futures_core::Stream<Item = std::result::Result<#res_message, tonic::Status>> + Send + 'static;
 
                     #method_doc
-                    async fn #name(&self, request: tonic::Request<tonic::Streaming<#req_message>>)
+                    async fn #name(#self_param, request: tonic::Request<tonic::Streaming<#req_message>>)
                         -> std::result::Result<tonic::Response<Self::#stream>, tonic::Status>;
                 }
             }
@@ -317,23 +360,15 @@ fn generate_named(
 
 fn generate_methods<T: Service>(
     service: &T,
+    emit_package: bool,
     proto_path: &str,
     compile_well_known_types: bool,
+    use_arc_self: bool,
 ) -> TokenStream {
     let mut stream = TokenStream::new();
 
     for method in service.methods() {
-        let path = format!(
-            "/{}{}{}/{}",
-            service.package(),
-            if service.package().is_empty() {
-                ""
-            } else {
-                "."
-            },
-            service.identifier(),
-            method.identifier()
-        );
+        let path = format_method_path(service, method, emit_package);
         let method_path = Lit::Str(LitStr::new(&path, Span::call_site()));
         let ident = quote::format_ident!("{}", method.name());
         let server_trait = quote::format_ident!("{}", service.name());
@@ -345,6 +380,7 @@ fn generate_methods<T: Service>(
                 compile_well_known_types,
                 ident,
                 server_trait,
+                use_arc_self,
             ),
 
             (false, true) => generate_server_streaming(
@@ -353,6 +389,7 @@ fn generate_methods<T: Service>(
                 compile_well_known_types,
                 ident.clone(),
                 server_trait,
+                use_arc_self,
             ),
             (true, false) => generate_client_streaming(
                 method,
@@ -360,6 +397,7 @@ fn generate_methods<T: Service>(
                 compile_well_known_types,
                 ident.clone(),
                 server_trait,
+                use_arc_self,
             ),
 
             (true, true) => generate_streaming(
@@ -368,6 +406,7 @@ fn generate_methods<T: Service>(
                 compile_well_known_types,
                 ident.clone(),
                 server_trait,
+                use_arc_self,
             ),
         };
 
@@ -388,12 +427,19 @@ fn generate_unary<T: Method>(
     compile_well_known_types: bool,
     method_ident: Ident,
     server_trait: Ident,
+    use_arc_self: bool,
 ) -> TokenStream {
     let codec_name = syn::parse_str::<syn::Path>(method.codec_path()).unwrap();
 
     let service_ident = quote::format_ident!("{}Svc", method.identifier());
 
     let (request, response) = method.request_response_name(proto_path, compile_well_known_types);
+
+    let inner_arg = if use_arc_self {
+        quote!(inner)
+    } else {
+        quote!(&inner)
+    };
 
     quote! {
         #[allow(non_camel_case_types)]
@@ -406,7 +452,7 @@ fn generate_unary<T: Method>(
             fn call(&mut self, request: tonic::Request<#request>) -> Self::Future {
                 let inner = Arc::clone(&self.0);
                 let fut = async move {
-                    (*inner).#method_ident(request).await
+                    <T as #server_trait>::#method_ident(#inner_arg, request).await
                 };
                 Box::pin(fut)
             }
@@ -414,6 +460,8 @@ fn generate_unary<T: Method>(
 
         let accept_compression_encodings = self.accept_compression_encodings;
         let send_compression_encodings = self.send_compression_encodings;
+        let max_decoding_message_size = self.max_decoding_message_size;
+        let max_encoding_message_size = self.max_encoding_message_size;
         let inner = self.inner.clone();
         let fut = async move {
             let inner = inner.0;
@@ -421,7 +469,8 @@ fn generate_unary<T: Method>(
             let codec = #codec_name::default();
 
             let mut grpc = tonic::server::Grpc::new(codec)
-                .apply_compression_config(accept_compression_encodings, send_compression_encodings);
+                .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
 
             let res = grpc.unary(method, req).await;
             Ok(res)
@@ -437,6 +486,7 @@ fn generate_server_streaming<T: Method>(
     compile_well_known_types: bool,
     method_ident: Ident,
     server_trait: Ident,
+    use_arc_self: bool,
 ) -> TokenStream {
     let codec_name = syn::parse_str::<syn::Path>(method.codec_path()).unwrap();
 
@@ -445,6 +495,12 @@ fn generate_server_streaming<T: Method>(
     let (request, response) = method.request_response_name(proto_path, compile_well_known_types);
 
     let response_stream = quote::format_ident!("{}Stream", method.identifier());
+
+    let inner_arg = if use_arc_self {
+        quote!(inner)
+    } else {
+        quote!(&inner)
+    };
 
     quote! {
         #[allow(non_camel_case_types)]
@@ -458,7 +514,7 @@ fn generate_server_streaming<T: Method>(
             fn call(&mut self, request: tonic::Request<#request>) -> Self::Future {
                 let inner = Arc::clone(&self.0);
                 let fut = async move {
-                    (*inner).#method_ident(request).await
+                    <T as #server_trait>::#method_ident(#inner_arg, request).await
                 };
                 Box::pin(fut)
             }
@@ -466,6 +522,8 @@ fn generate_server_streaming<T: Method>(
 
         let accept_compression_encodings = self.accept_compression_encodings;
         let send_compression_encodings = self.send_compression_encodings;
+        let max_decoding_message_size = self.max_decoding_message_size;
+        let max_encoding_message_size = self.max_encoding_message_size;
         let inner = self.inner.clone();
         let fut = async move {
             let inner = inner.0;
@@ -473,7 +531,8 @@ fn generate_server_streaming<T: Method>(
             let codec = #codec_name::default();
 
             let mut grpc = tonic::server::Grpc::new(codec)
-                .apply_compression_config(accept_compression_encodings, send_compression_encodings);
+                .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
 
             let res = grpc.server_streaming(method, req).await;
             Ok(res)
@@ -489,11 +548,18 @@ fn generate_client_streaming<T: Method>(
     compile_well_known_types: bool,
     method_ident: Ident,
     server_trait: Ident,
+    use_arc_self: bool,
 ) -> TokenStream {
     let service_ident = quote::format_ident!("{}Svc", method.identifier());
 
     let (request, response) = method.request_response_name(proto_path, compile_well_known_types);
     let codec_name = syn::parse_str::<syn::Path>(method.codec_path()).unwrap();
+
+    let inner_arg = if use_arc_self {
+        quote!(inner)
+    } else {
+        quote!(&inner)
+    };
 
     quote! {
         #[allow(non_camel_case_types)]
@@ -507,8 +573,7 @@ fn generate_client_streaming<T: Method>(
             fn call(&mut self, request: tonic::Request<tonic::Streaming<#request>>) -> Self::Future {
                 let inner = Arc::clone(&self.0);
                 let fut = async move {
-                    (*inner).#method_ident(request).await
-
+                    <T as #server_trait>::#method_ident(#inner_arg, request).await
                 };
                 Box::pin(fut)
             }
@@ -516,6 +581,8 @@ fn generate_client_streaming<T: Method>(
 
         let accept_compression_encodings = self.accept_compression_encodings;
         let send_compression_encodings = self.send_compression_encodings;
+        let max_decoding_message_size = self.max_decoding_message_size;
+        let max_encoding_message_size = self.max_encoding_message_size;
         let inner = self.inner.clone();
         let fut = async move {
             let inner = inner.0;
@@ -523,7 +590,8 @@ fn generate_client_streaming<T: Method>(
             let codec = #codec_name::default();
 
             let mut grpc = tonic::server::Grpc::new(codec)
-                .apply_compression_config(accept_compression_encodings, send_compression_encodings);
+                .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
 
             let res = grpc.client_streaming(method, req).await;
             Ok(res)
@@ -539,6 +607,7 @@ fn generate_streaming<T: Method>(
     compile_well_known_types: bool,
     method_ident: Ident,
     server_trait: Ident,
+    use_arc_self: bool,
 ) -> TokenStream {
     let codec_name = syn::parse_str::<syn::Path>(method.codec_path()).unwrap();
 
@@ -547,6 +616,12 @@ fn generate_streaming<T: Method>(
     let (request, response) = method.request_response_name(proto_path, compile_well_known_types);
 
     let response_stream = quote::format_ident!("{}Stream", method.identifier());
+
+    let inner_arg = if use_arc_self {
+        quote!(inner)
+    } else {
+        quote!(&inner)
+    };
 
     quote! {
         #[allow(non_camel_case_types)]
@@ -561,7 +636,7 @@ fn generate_streaming<T: Method>(
             fn call(&mut self, request: tonic::Request<tonic::Streaming<#request>>) -> Self::Future {
                 let inner = Arc::clone(&self.0);
                 let fut = async move {
-                    (*inner).#method_ident(request).await
+                    <T as #server_trait>::#method_ident(#inner_arg, request).await
                 };
                 Box::pin(fut)
             }
@@ -569,6 +644,8 @@ fn generate_streaming<T: Method>(
 
         let accept_compression_encodings = self.accept_compression_encodings;
         let send_compression_encodings = self.send_compression_encodings;
+        let max_decoding_message_size = self.max_decoding_message_size;
+        let max_encoding_message_size = self.max_encoding_message_size;
         let inner = self.inner.clone();
         let fut = async move {
             let inner = inner.0;
@@ -576,7 +653,8 @@ fn generate_streaming<T: Method>(
             let codec = #codec_name::default();
 
             let mut grpc = tonic::server::Grpc::new(codec)
-                .apply_compression_config(accept_compression_encodings, send_compression_encodings);
+                .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
 
             let res = grpc.streaming(method, req).await;
             Ok(res)
